@@ -38,7 +38,9 @@ apt install -y \
   wmctrl \
   rsync \
   sudo \
-  libxml2-utils
+  libxml2-utils \
+  beep \
+  util-linux
 
 systemctl enable NetworkManager
 systemctl enable cups
@@ -80,6 +82,7 @@ chmod 0700 "/home/$KIOSK_USER"
 # Persistent skeleton
 # =========================
 mkdir -p /etc/kiosk-skel/.config/openbox
+mkdir -p /etc/kiosk-skel/usb-imports
 
 # =========================
 # Reset scripts
@@ -130,6 +133,157 @@ while true; do
 done
 EOF
 chmod 0755 /usr/local/bin/kiosk-focus-chromium.sh
+
+# =========================
+# PC speaker support
+# =========================
+mkdir -p /etc/modules-load.d
+echo pcspkr > /etc/modules-load.d/pcspkr.conf
+
+# Remove blacklist entries if present
+if grep -Rqs '^[[:space:]]*blacklist[[:space:]]\+pcspkr' /etc/modprobe.d 2>/dev/null; then
+  grep -Rls '^[[:space:]]*blacklist[[:space:]]\+pcspkr' /etc/modprobe.d 2>/dev/null | while read -r f; do
+    sed -i 's/^[[:space:]]*blacklist[[:space:]]\+pcspkr/# disabled by kiosk install: blacklist pcspkr/' "$f"
+  done
+fi
+
+modprobe pcspkr || true
+chmod 4755 /usr/bin/beep || true
+
+# =========================
+# USB import support
+# =========================
+mkdir -p /run/kiosk-usb
+mkdir -p /home/kiosk/usb-imports
+chown kiosk:kiosk /home/kiosk/usb-imports || true
+
+cat > /usr/local/sbin/kiosk-import-usb.sh <<'EOF'
+#!/bin/bash
+set -u
+
+DEV="${1:-}"
+LOCKFILE="/run/kiosk-usb/import.lock"
+MOUNTROOT="/run/kiosk-usb"
+DESTROOT="/home/kiosk/usb-imports"
+
+log() {
+    logger -t kiosk-usb-import "$*"
+    echo "$*"
+}
+
+happy_beep() {
+  command -v beep >/dev/null 2>&1 || return 0
+  beep -f 523 -l 180 -D 90 -n \
+       -f 659 -l 180 -D 90 -n \
+       -f 784 -l 180 -D 90 -n \
+       -f 1046 -l 350
+}
+
+sadmac_beep() {
+  command -v beep >/dev/null 2>&1 || return 0
+  beep -f 659 -l 220 -D 120 -n \
+       -f 587 -l 220 -D 120 -n \
+       -f 523 -l 260 -D 180 -n \
+       -f 440 -l 400 -D 220 -n \
+       -f 95  -l 60 -D 20 -n \
+       -f 95  -l 40 -D 20 -n \
+       -f 95  -l 28 -D 140 -n \
+       -f 72  -l 70 -D 20 -n \
+       -f 72  -l 48 -D 20 -n \
+       -f 72  -l 32
+}
+
+cleanup_mount() {
+    local mnt="$1"
+    if mountpoint -q "$mnt"; then
+        umount "$mnt" >/dev/null 2>&1 || umount -l "$mnt" >/dev/null 2>&1 || true
+    fi
+    rmdir "$mnt" >/dev/null 2>&1 || true
+}
+
+fail_exit() {
+    local mnt="$1"
+    log "FAILED for $DEV"
+    cleanup_mount "$mnt"
+    sadmac_beep
+    exit 1
+}
+
+if [ -z "$DEV" ] || [ ! -b "$DEV" ]; then
+    log "Invalid device: $DEV"
+    sadmac_beep
+    exit 1
+fi
+
+mkdir -p "$MOUNTROOT" "$DESTROOT"
+
+exec 9>"$LOCKFILE"
+flock -n 9 || {
+    log "Another USB import is already running, refusing $DEV"
+    sadmac_beep
+    exit 1
+}
+
+BASENAME="$(basename "$DEV")"
+MNT="$MOUNTROOT/$BASENAME"
+
+LABEL="$(blkid -o value -s LABEL "$DEV" 2>/dev/null || true)"
+UUID="$(blkid -o value -s UUID "$DEV" 2>/dev/null || true)"
+
+SAFE_LABEL="$(printf '%s' "${LABEL:-usb}" | tr -cs 'A-Za-z0-9._-' '_')"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+
+if [ -n "$UUID" ]; then
+    DEST="$DESTROOT/${STAMP}_${SAFE_LABEL}_${UUID}"
+else
+    DEST="$DESTROOT/${STAMP}_${SAFE_LABEL}_${BASENAME}"
+fi
+
+mkdir -p "$MNT" || {
+    log "Could not create mountpoint $MNT"
+    sadmac_beep
+    exit 1
+}
+
+mount -o ro,nosuid,nodev "$DEV" "$MNT" || fail_exit "$MNT"
+
+mkdir -p "$DEST" || fail_exit "$MNT"
+
+log "Copying from $DEV to $DEST"
+
+if rsync -a --protect-args "$MNT"/ "$DEST"/; then
+    chown -R kiosk:kiosk "$DEST" || true
+    chmod -R u+rwX,go+rX "$DEST" || true
+
+    log "Copy succeeded for $DEV"
+    cleanup_mount "$MNT"
+    sync
+    happy_beep
+    exit 0
+else
+    log "Copy failed for $DEV"
+    rm -rf "$DEST" >/dev/null 2>&1 || true
+    cleanup_mount "$MNT"
+    sadmac_beep
+    exit 1
+fi
+EOF
+chmod 0755 /usr/local/sbin/kiosk-import-usb.sh
+
+cat > /etc/systemd/system/kiosk-usb-import@.service <<'EOF'
+[Unit]
+Description=Import files from USB device /dev/%I
+After=local-fs.target
+ConditionPathExists=/dev/%I
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kiosk-import-usb.sh /dev/%I
+EOF
+
+cat > /etc/udev/rules.d/99-kiosk-usb-import.rules <<'EOF'
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="kiosk-usb-import@%k.service"
+EOF
 
 # =========================
 # Sudoers for kiosk session reset
@@ -214,9 +368,6 @@ ns_uri = "http://openbox.org/3.4/rc"
 ns = {"ob": ns_uri}
 ET.register_namespace("", ns_uri)
 
-def q(tag):
-    return f"{{{ns_uri}}}{tag}"
-
 # Set title layout to Name + Close
 for tl in root.findall(".//ob:theme/ob:titleLayout", ns):
     tl.text = "NC"
@@ -277,10 +428,16 @@ Openbox config: /etc/kiosk-skel/.config/openbox/rc.xml
 Wipe script: /usr/local/sbin/kiosk-wipe-home.sh
 Init script: /usr/local/sbin/kiosk-init-home.sh
 Chromium watchdog: /usr/local/bin/kiosk-focus-chromium.sh
+USB import script: /usr/local/sbin/kiosk-import-usb.sh
+USB import service: /etc/systemd/system/kiosk-usb-import@.service
+USB import rule: /etc/udev/rules.d/99-kiosk-usb-import.rules
+USB import destination: /home/kiosk/usb-imports
+PC speaker module: /etc/modules-load.d/pcspkr.conf
 Lid close poweroff: /etc/systemd/logind.conf
 Printing (CUPS): http://localhost:631
 Queue status: lpstat -t
 Cancel all jobs: cancel -a
+USB import logs: journalctl -f -t kiosk-usb-import
 ============================================
 EOF
 chmod 0644 /etc/sysop-kiosk-notes.txt
@@ -309,6 +466,8 @@ fi
 # =========================
 systemctl daemon-reload
 systemctl restart systemd-logind || true
+udevadm control --reload
+udevadm trigger || true
 
 echo
 echo "Done."
@@ -320,4 +479,5 @@ echo "3. Verify Chromium opens maximized"
 echo "4. Verify closing Chromium resets the session"
 echo "5. Configure Wi-Fi with nmtui or nmcli"
 echo "6. Configure USB printer in CUPS at http://localhost:631 if needed"
-echo
+echo "7. Test PC speaker with: beep"
+echo "8. Insert a USB stick and watch logs with: journalctl -f -t kiosk-usb-import"
