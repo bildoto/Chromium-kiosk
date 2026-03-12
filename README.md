@@ -1,5 +1,6 @@
 This script creates a browser kiosk on top of Debian Trixie. 
-It securely wipes everything when browser is closed, the computer is shut down, or the lid is closed ona laptop.
+
+It securely wipes everything when browser is closed, the computer is shut down, or the lid is closed on a laptop.
 
 It assumes Debian 13 / Trixie, where the packages you used are available under the expected names, including chromium, openbox, xorg, network-manager, cups, and wmctrl.
 
