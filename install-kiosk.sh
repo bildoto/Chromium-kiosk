@@ -40,7 +40,9 @@ apt install -y \
   sudo \
   libxml2-utils \
   beep \
-  util-linux
+  util-linux \
+  dosfstools \
+  python3
 
 systemctl enable NetworkManager
 systemctl enable cups
@@ -151,23 +153,37 @@ modprobe pcspkr || true
 chmod 4755 /usr/bin/beep || true
 
 # =========================
-# USB import support
+# USB state runtime dirs
 # =========================
+cat > /etc/tmpfiles.d/kiosk-usb.conf <<'EOF'
+d /run/kiosk-usb 0755 root root -
+d /run/kiosk-usb-state 0755 root root -
+d /run/kiosk-usb-state/by-devname 0755 root root -
+EOF
+systemd-tmpfiles --create /etc/tmpfiles.d/kiosk-usb.conf || true
+
 mkdir -p /run/kiosk-usb
+mkdir -p /run/kiosk-usb-state/by-devname
 mkdir -p /home/kiosk/usb-imports
 chown kiosk:kiosk /home/kiosk/usb-imports || true
+chmod 700 /home/kiosk/usb-imports || true
 
+# =========================
+# USB import / wipe / recovery
+# =========================
 cat > /usr/local/sbin/kiosk-import-usb.sh <<'EOF'
 #!/bin/bash
 set -u
 
 DEV="${1:-}"
+STATE_DIR="/run/kiosk-usb-state"
+MAP_DIR="$STATE_DIR/by-devname"
 LOCKFILE="/run/kiosk-usb/import.lock"
 MOUNTROOT="/run/kiosk-usb"
 DESTROOT="/home/kiosk/usb-imports"
 
 log() {
-    logger -t kiosk-usb-import "$*"
+    logger -t kiosk-usb "$*"
     echo "$*"
 }
 
@@ -177,6 +193,12 @@ happy_beep() {
        -f 659 -l 180 -D 90 -n \
        -f 784 -l 180 -D 90 -n \
        -f 1046 -l 350
+}
+
+wipe_beep() {
+  command -v beep >/dev/null 2>&1 || return 0
+  beep -f 700 -l 250 -D 120 -n \
+       -f 400 -l 400
 }
 
 sadmac_beep() {
@@ -201,10 +223,111 @@ cleanup_mount() {
     rmdir "$mnt" >/dev/null 2>&1 || true
 }
 
+get_uuid() {
+    blkid -o value -s UUID "$1" 2>/dev/null || true
+}
+
+get_parent_disk() {
+    local part="$1"
+    local parent
+    parent="$(lsblk -no pkname "$part" 2>/dev/null | head -n1)"
+    [ -n "$parent" ] && echo "/dev/$parent"
+}
+
+is_usb_disk() {
+    local disk="$1"
+    local tran
+    tran="$(lsblk -no TRAN "$disk" 2>/dev/null | head -n1)"
+    [ "$tran" = "usb" ]
+}
+
+state_file_for() {
+    local uuid="$1"
+    echo "$STATE_DIR/$uuid"
+}
+
+read_state() {
+    local uuid="$1"
+    local sf
+    sf="$(state_file_for "$uuid")"
+    [ -f "$sf" ] && cat "$sf" || true
+}
+
+write_state() {
+    local uuid="$1"
+    local value="$2"
+    printf '%s\n' "$value" > "$(state_file_for "$uuid")"
+}
+
+clear_state() {
+    local uuid="$1"
+    rm -f "$(state_file_for "$uuid")"
+}
+
+write_dev_map() {
+    local devbase="$1"
+    local uuid="$2"
+    mkdir -p "$MAP_DIR"
+    printf '%s\n' "$uuid" > "$MAP_DIR/$devbase"
+}
+
+clear_dev_map() {
+    local devbase="$1"
+    rm -f "$MAP_DIR/$devbase"
+}
+
+do_import() {
+    local dev="$1"
+    local uuid="$2"
+    local mnt="$3"
+    local label dest safe_label stamp
+
+    label="$(blkid -o value -s LABEL "$dev" 2>/dev/null || true)"
+    safe_label="$(printf '%s' "${label:-usb}" | tr -cs 'A-Za-z0-9._-' '_')"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    dest="$DESTROOT/${stamp}_${safe_label}_${uuid}"
+
+    mkdir -p "$mnt" || return 1
+    mount -o ro,nosuid,nodev "$dev" "$mnt" || return 1
+    mkdir -p "$dest" || {
+        cleanup_mount "$mnt"
+        return 1
+    }
+
+    log "Importing from $dev to $dest"
+
+    if rsync -a --protect-args "$mnt"/ "$dest"/; then
+        chown -R kiosk:kiosk "$dest" || true
+        chmod -R u+rwX,go-rwx "$dest" || true
+        cleanup_mount "$mnt"
+        sync
+        return 0
+    else
+        rm -rf "$dest" >/dev/null 2>&1 || true
+        cleanup_mount "$mnt"
+        return 1
+    fi
+}
+
+do_wipe() {
+    local dev="$1"
+    local disk
+
+    disk="$(get_parent_disk "$dev")"
+    [ -n "$disk" ] || return 1
+    is_usb_disk "$disk" || return 1
+
+    log "Wiping USB disk $disk for partition $dev"
+
+    wipefs -a "$disk" >/dev/null 2>&1 || return 1
+    mkfs.vfat -F 32 -I "$disk" >/dev/null 2>&1 || return 1
+    sync
+    return 0
+}
+
 fail_exit() {
-    local mnt="$1"
-    log "FAILED for $DEV"
-    cleanup_mount "$mnt"
+    local mnt="${1:-}"
+    [ -n "$mnt" ] && cleanup_mount "$mnt"
     sadmac_beep
     exit 1
 }
@@ -215,64 +338,183 @@ if [ -z "$DEV" ] || [ ! -b "$DEV" ]; then
     exit 1
 fi
 
-mkdir -p "$MOUNTROOT" "$DESTROOT"
+mkdir -p "$STATE_DIR" "$MAP_DIR" "$MOUNTROOT" "$DESTROOT"
+
+UUID="$(get_uuid "$DEV")"
+[ -n "$UUID" ] || UUID="$(basename "$DEV")"
+
+STATE="$(read_state "$UUID")"
+DEVBASE="$(basename "$DEV")"
+MNT="$MOUNTROOT/$DEVBASE"
 
 exec 9>"$LOCKFILE"
 flock -n 9 || {
-    log "Another USB import is already running, refusing $DEV"
+    log "Another USB action is already running, refusing $DEV"
     sadmac_beep
     exit 1
 }
 
-BASENAME="$(basename "$DEV")"
-MNT="$MOUNTROOT/$BASENAME"
-
-LABEL="$(blkid -o value -s LABEL "$DEV" 2>/dev/null || true)"
-UUID="$(blkid -o value -s UUID "$DEV" 2>/dev/null || true)"
-
-SAFE_LABEL="$(printf '%s' "${LABEL:-usb}" | tr -cs 'A-Za-z0-9._-' '_')"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-
-if [ -n "$UUID" ]; then
-    DEST="$DESTROOT/${STAMP}_${SAFE_LABEL}_${UUID}"
-else
-    DEST="$DESTROOT/${STAMP}_${SAFE_LABEL}_${BASENAME}"
-fi
-
-mkdir -p "$MNT" || {
-    log "Could not create mountpoint $MNT"
-    sadmac_beep
-    exit 1
-}
-
-mount -o ro,nosuid,nodev "$DEV" "$MNT" || fail_exit "$MNT"
-
-mkdir -p "$DEST" || fail_exit "$MNT"
-
-log "Copying from $DEV to $DEST"
-
-if rsync -a --protect-args "$MNT"/ "$DEST"/; then
-    chown -R kiosk:kiosk "$DEST" || true
-    chmod -R u+rwX,go+rX "$DEST" || true
-
-    log "Copy succeeded for $DEV"
-    cleanup_mount "$MNT"
-    sync
-    happy_beep
-    exit 0
-else
-    log "Copy failed for $DEV"
-    rm -rf "$DEST" >/dev/null 2>&1 || true
-    cleanup_mount "$MNT"
-    sadmac_beep
-    exit 1
-fi
+case "$STATE" in
+    wipe)
+        if do_wipe "$DEV"; then
+            clear_state "$UUID"
+            clear_dev_map "$DEVBASE"
+            log "Wipe successful for $DEV ($UUID)"
+            wipe_beep
+            exit 0
+        else
+            log "Wipe failed for $DEV ($UUID)"
+            sadmac_beep
+            exit 1
+        fi
+        ;;
+    ""|copied)
+        if do_import "$DEV" "$UUID" "$MNT"; then
+            write_state "$UUID" "copied"
+            write_dev_map "$DEVBASE" "$UUID"
+            log "Import successful for $DEV ($UUID)"
+            happy_beep
+            exit 0
+        else
+            log "Import failed for $DEV ($UUID)"
+            fail_exit "$MNT"
+        fi
+        ;;
+    *)
+        log "Unknown state '$STATE' for $UUID"
+        sadmac_beep
+        exit 1
+        ;;
+esac
 EOF
 chmod 0755 /usr/local/sbin/kiosk-import-usb.sh
 
+cat > /usr/local/sbin/kiosk-remove-usb.sh <<'EOF'
+#!/bin/bash
+set -u
+
+DEVBASE="${1:-}"
+STATE_DIR="/run/kiosk-usb-state"
+MAP_DIR="$STATE_DIR/by-devname"
+
+log() {
+    logger -t kiosk-usb "$*"
+    echo "$*"
+}
+
+if [ -z "$DEVBASE" ]; then
+    exit 0
+fi
+
+MAP_FILE="$MAP_DIR/$DEVBASE"
+[ -f "$MAP_FILE" ] || exit 0
+
+UUID="$(cat "$MAP_FILE" 2>/dev/null || true)"
+[ -n "$UUID" ] || exit 0
+
+STATE_FILE="$STATE_DIR/$UUID"
+STATE="$(cat "$STATE_FILE" 2>/dev/null || true)"
+
+if [ "$STATE" = "copied" ]; then
+    printf '%s\n' "wipe" > "$STATE_FILE"
+    log "Armed wipe for UUID $UUID after removal of $DEVBASE"
+fi
+
+rm -f "$MAP_FILE"
+exit 0
+EOF
+chmod 0755 /usr/local/sbin/kiosk-remove-usb.sh
+
+cat > /usr/local/sbin/kiosk-recover-usb.sh <<'EOF'
+#!/bin/bash
+set -u
+
+STATE_DIR="/run/kiosk-usb-state"
+MAP_DIR="$STATE_DIR/by-devname"
+LOCKFILE="/run/kiosk-usb/import.lock"
+MOUNTROOT="/run/kiosk-usb"
+DESTROOT="/home/kiosk/usb-imports"
+
+log() {
+    logger -t kiosk-usb-recover "$*"
+    echo "$*"
+}
+
+happy_beep() {
+  command -v beep >/dev/null 2>&1 || return 0
+  beep -f 523 -l 180 -D 90 -n \
+       -f 659 -l 180 -D 90 -n \
+       -f 784 -l 180 -D 90 -n \
+       -f 1046 -l 350
+}
+
+do_import() {
+    local dev="$1"
+    local uuid="$2"
+    local mnt="$3"
+    local label dest safe_label stamp
+
+    label="$(blkid -o value -s LABEL "$dev" 2>/dev/null || true)"
+    safe_label="$(printf '%s' "${label:-usb}" | tr -cs 'A-Za-z0-9._-' '_')"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    dest="$DESTROOT/${stamp}_${safe_label}_${uuid}"
+
+    mkdir -p "$mnt" || return 1
+    mount -o ro,nosuid,nodev "$dev" "$mnt" || return 1
+    mkdir -p "$dest" || {
+        if mountpoint -q "$mnt"; then umount "$mnt" || true; fi
+        rmdir "$mnt" >/dev/null 2>&1 || true
+        return 1
+    }
+
+    if rsync -a --protect-args "$mnt"/ "$dest"/; then
+        chown -R kiosk:kiosk "$dest" || true
+        chmod -R u+rwX,go-rwx "$dest" || true
+        if mountpoint -q "$mnt"; then umount "$mnt" || true; fi
+        rmdir "$mnt" >/dev/null 2>&1 || true
+        sync
+        return 0
+    else
+        rm -rf "$dest" >/dev/null 2>&1 || true
+        if mountpoint -q "$mnt"; then umount "$mnt" || true; fi
+        rmdir "$mnt" >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+mkdir -p "$STATE_DIR" "$MAP_DIR" "$MOUNTROOT" "$DESTROOT"
+
+exec 9>"$LOCKFILE"
+flock -n 9 || exit 0
+
+for dev in /dev/disk/by-uuid/*; do
+    [ -e "$dev" ] || continue
+    UUID="$(basename "$dev")"
+    STATE_FILE="$STATE_DIR/$UUID"
+    [ -f "$STATE_FILE" ] || continue
+    [ "$(cat "$STATE_FILE" 2>/dev/null)" = "copied" ] || continue
+
+    REALDEV="$(readlink -f "$dev")"
+    [ -b "$REALDEV" ] || continue
+
+    DEVBASE="$(basename "$REALDEV")"
+    MNT="$MOUNTROOT/$DEVBASE"
+
+    log "Recovery import for $REALDEV ($UUID)"
+
+    if do_import "$REALDEV" "$UUID" "$MNT"; then
+        printf '%s\n' "$UUID" > "$MAP_DIR/$DEVBASE"
+        happy_beep
+    fi
+done
+
+exit 0
+EOF
+chmod 0755 /usr/local/sbin/kiosk-recover-usb.sh
+
 cat > /etc/systemd/system/kiosk-usb-import@.service <<'EOF'
 [Unit]
-Description=Import files from USB device /dev/%I
+Description=Import or wipe files from USB device /dev/%I
 After=local-fs.target
 ConditionPathExists=/dev/%I
 
@@ -281,15 +523,25 @@ Type=oneshot
 ExecStart=/usr/local/sbin/kiosk-import-usb.sh /dev/%I
 EOF
 
-cat > /etc/udev/rules.d/99-kiosk-usb-import.rules <<'EOF'
+cat > /etc/systemd/system/kiosk-usb-remove@.service <<'EOF'
+[Unit]
+Description=Handle removal of USB device %I
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kiosk-remove-usb.sh %I
+EOF
+
+cat > /etc/udev/rules.d/99-kiosk-usb.rules <<'EOF'
 ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="kiosk-usb-import@%k.service"
+ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", TAG+="systemd", ENV{SYSTEMD_WANTS}+="kiosk-usb-remove@%k.service"
 EOF
 
 # =========================
 # Sudoers for kiosk session reset
 # =========================
 cat > /etc/sudoers.d/kiosk <<'EOF'
-kiosk ALL=(root) NOPASSWD: /usr/local/sbin/kiosk-wipe-home.sh, /usr/local/sbin/kiosk-init-home.sh
+kiosk ALL=(root) NOPASSWD: /usr/local/sbin/kiosk-wipe-home.sh, /usr/local/sbin/kiosk-init-home.sh, /usr/local/sbin/kiosk-recover-usb.sh
 EOF
 chmod 0440 /etc/sudoers.d/kiosk
 visudo -cf /etc/sudoers.d/kiosk
@@ -312,6 +564,7 @@ if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
     while true; do
         /usr/bin/sudo /usr/local/sbin/kiosk-wipe-home.sh
         /usr/bin/sudo /usr/local/sbin/kiosk-init-home.sh
+        /usr/bin/sudo /usr/local/sbin/kiosk-recover-usb.sh
         startx
     done
 fi
@@ -428,16 +681,26 @@ Openbox config: /etc/kiosk-skel/.config/openbox/rc.xml
 Wipe script: /usr/local/sbin/kiosk-wipe-home.sh
 Init script: /usr/local/sbin/kiosk-init-home.sh
 Chromium watchdog: /usr/local/bin/kiosk-focus-chromium.sh
-USB import script: /usr/local/sbin/kiosk-import-usb.sh
-USB import service: /etc/systemd/system/kiosk-usb-import@.service
-USB import rule: /etc/udev/rules.d/99-kiosk-usb-import.rules
+USB add handler: /usr/local/sbin/kiosk-import-usb.sh
+USB remove handler: /usr/local/sbin/kiosk-remove-usb.sh
+USB recovery handler: /usr/local/sbin/kiosk-recover-usb.sh
+USB add service: /etc/systemd/system/kiosk-usb-import@.service
+USB remove service: /etc/systemd/system/kiosk-usb-remove@.service
+USB udev rules: /etc/udev/rules.d/99-kiosk-usb.rules
 USB import destination: /home/kiosk/usb-imports
+USB state dir (RAM): /run/kiosk-usb-state
+USB workflow:
+- Insert fresh stick: import + happy beep
+- Restart with stick still inserted: re-import + happy beep
+- Remove stick: arms wipe
+- Next insert of same stick: wipe + wipe tune
 PC speaker module: /etc/modules-load.d/pcspkr.conf
 Lid close poweroff: /etc/systemd/logind.conf
 Printing (CUPS): http://localhost:631
 Queue status: lpstat -t
 Cancel all jobs: cancel -a
-USB import logs: journalctl -f -t kiosk-usb-import
+USB logs: journalctl -f -t kiosk-usb
+Recovery logs: journalctl -f -t kiosk-usb-recover
 ============================================
 EOF
 chmod 0644 /etc/sysop-kiosk-notes.txt
@@ -467,7 +730,6 @@ fi
 systemctl daemon-reload
 systemctl restart systemd-logind || true
 udevadm control --reload
-udevadm trigger || true
 
 echo
 echo "Done."
@@ -480,4 +742,8 @@ echo "4. Verify closing Chromium resets the session"
 echo "5. Configure Wi-Fi with nmtui or nmcli"
 echo "6. Configure USB printer in CUPS at http://localhost:631 if needed"
 echo "7. Test PC speaker with: beep"
-echo "8. Insert a USB stick and watch logs with: journalctl -f -t kiosk-usb-import"
+echo "8. Test USB workflow:"
+echo "   - fresh insert => import + happy beep"
+echo "   - browser close with stick still inserted => auto re-import"
+echo "   - remove stick"
+echo "   - reinsert same stick => wipe + wipe tune"
