@@ -18,35 +18,69 @@ It does not add a secret rescue hotkey, because your final setup used the Chromi
 
 
 
+
 Final System Behavior
+
+
 
 Boot:
 
+
+
 Boot
+
 ↓
+
 tty1 autologin
+
 ↓
+
 wipe RAM home
+
 ↓
+
 copy /etc/kiosk-skel
+
 ↓
+
 start X
+
 ↓
+
 Openbox
+
 ↓
+
 Chromium
+
+
+
+
 
 User closes browser:
 
 browser closes
+
 ↓
+
 X exits
+
 ↓
+
 session loop restarts
+
 ↓
+
 home wiped again
+
 ↓
+
 fresh browser
+
+
+
+
+
 
 Reboot or poweroff:
 
