@@ -2,7 +2,6 @@
 set -euo pipefail
 
 KIOSK_USER="kiosk"
-DESTROOT="/home/${KIOSK_USER}/usb-imports"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run this script as root."
@@ -14,11 +13,20 @@ if ! id "$KIOSK_USER" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Installing required packages..."
-apt update
-apt install -y rsync beep util-linux dosfstools
+export DEBIAN_FRONTEND=noninteractive
 
-echo "Creating runtime tmpfiles config..."
+apt update
+apt install -y \
+  rsync \
+  sudo \
+  util-linux \
+  dosfstools \
+  parted \
+  beep
+
+# =========================
+# USB state runtime dirs
+# =========================
 cat > /etc/tmpfiles.d/kiosk-usb.conf <<'EOF'
 d /run/kiosk-usb 0755 root root -
 d /run/kiosk-usb-state 0755 root root -
@@ -27,13 +35,12 @@ EOF
 
 systemd-tmpfiles --create /etc/tmpfiles.d/kiosk-usb.conf || true
 
-echo "Creating USB import destination..."
-mkdir -p "$DESTROOT"
-chown "$KIOSK_USER:$KIOSK_USER" "$DESTROOT"
-chmod 700 "$DESTROOT"
+mkdir -p /run/kiosk-usb
+mkdir -p /run/kiosk-usb-state/by-devname
 
-echo "Creating USB handler scripts..."
-
+# =========================
+# USB import / wipe / recovery
+# =========================
 cat > /usr/local/sbin/kiosk-import-usb.sh <<'EOF'
 #!/bin/bash
 set -u
@@ -43,7 +50,7 @@ STATE_DIR="/run/kiosk-usb-state"
 MAP_DIR="$STATE_DIR/by-devname"
 LOCKFILE="/run/kiosk-usb/import.lock"
 MOUNTROOT="/run/kiosk-usb"
-DESTROOT="/home/kiosk/usb-imports"
+DESTROOT="/home/kiosk"
 
 log() {
     logger -t kiosk-usb "$*"
@@ -143,19 +150,12 @@ do_import() {
     local dev="$1"
     local uuid="$2"
     local mnt="$3"
-    local label dest safe_label stamp
+    local dest
 
-    label="$(blkid -o value -s LABEL "$dev" 2>/dev/null || true)"
-    safe_label="$(printf '%s' "${label:-usb}" | tr -cs 'A-Za-z0-9._-' '_')"
-    stamp="$(date +%Y%m%d-%H%M%S)"
-    dest="$DESTROOT/${stamp}_${safe_label}_${uuid}"
+    dest="$DESTROOT"
 
     mkdir -p "$mnt" || return 1
     mount -o ro,nosuid,nodev "$dev" "$mnt" || return 1
-    mkdir -p "$dest" || {
-        cleanup_mount "$mnt"
-        return 1
-    }
 
     log "Importing from $dev to $dest"
 
@@ -166,7 +166,6 @@ do_import() {
         sync
         return 0
     else
-        rm -rf "$dest" >/dev/null 2>&1 || true
         cleanup_mount "$mnt"
         return 1
     fi
@@ -175,6 +174,7 @@ do_import() {
 do_wipe() {
     local dev="$1"
     local disk
+    local part
 
     disk="$(get_parent_disk "$dev")"
     [ -n "$disk" ] || return 1
@@ -183,7 +183,25 @@ do_wipe() {
     log "Wiping USB disk $disk for partition $dev"
 
     wipefs -a "$disk" >/dev/null 2>&1 || return 1
-    mkfs.vfat -F 32 -I "$disk" >/dev/null 2>&1 || return 1
+    parted -s "$disk" mklabel msdos >/dev/null 2>&1 || return 1
+    parted -s "$disk" mkpart primary fat32 1MiB 100% >/dev/null 2>&1 || return 1
+
+    partprobe "$disk" >/dev/null 2>&1 || true
+    udevadm settle >/dev/null 2>&1 || true
+    sleep 1
+
+    case "$disk" in
+      /dev/nvme*|/dev/mmcblk*)
+        part="${disk}p1"
+        ;;
+      *)
+        part="${disk}1"
+        ;;
+    esac
+
+    [ -b "$part" ] || return 1
+
+    mkfs.vfat -F 32 "$part" >/dev/null 2>&1 || return 1
     sync
     return 0
 }
@@ -204,14 +222,18 @@ fi
 mkdir -p "$STATE_DIR" "$MAP_DIR" "$MOUNTROOT" "$DESTROOT"
 
 UUID="$(get_uuid "$DEV")"
-[ -n "$UUID" ] || UUID="$(basename "$DEV")"
+if [ -z "$UUID" ]; then
+    log "No filesystem UUID found for $DEV, refusing to proceed"
+    sadmac_beep
+    exit 1
+fi
 
 STATE="$(read_state "$UUID")"
 DEVBASE="$(basename "$DEV")"
 MNT="$MOUNTROOT/$DEVBASE"
 
 exec 9>"$LOCKFILE"
-flock -n 9 || {
+flock -w 5 9 || {
     log "Another USB action is already running, refusing $DEV"
     sadmac_beep
     exit 1
@@ -250,44 +272,29 @@ case "$STATE" in
         ;;
 esac
 EOF
-
 chmod 0755 /usr/local/sbin/kiosk-import-usb.sh
 
 cat > /usr/local/sbin/kiosk-remove-usb.sh <<'EOF'
 #!/bin/bash
 set -u
 
-DEVBASE="${1:-}"
 STATE_DIR="/run/kiosk-usb-state"
 MAP_DIR="$STATE_DIR/by-devname"
 
-log() {
-    logger -t kiosk-usb "$*"
-    echo "$*"
-}
+for map in "$MAP_DIR"/*; do
+    [ -f "$map" ] || continue
+    UUID="$(cat "$map" 2>/dev/null || true)"
+    [ -n "$UUID" ] || continue
+    STATE_FILE="$STATE_DIR/$UUID"
+    STATE="$(cat "$STATE_FILE" 2>/dev/null || true)"
+    if [ "$STATE" = "copied" ]; then
+        printf '%s\n' "wipe" > "$STATE_FILE"
+    fi
+    rm -f "$map"
+done
 
-if [ -z "$DEVBASE" ]; then
-    exit 0
-fi
-
-MAP_FILE="$MAP_DIR/$DEVBASE"
-[ -f "$MAP_FILE" ] || exit 0
-
-UUID="$(cat "$MAP_FILE" 2>/dev/null || true)"
-[ -n "$UUID" ] || exit 0
-
-STATE_FILE="$STATE_DIR/$UUID"
-STATE="$(cat "$STATE_FILE" 2>/dev/null || true)"
-
-if [ "$STATE" = "copied" ]; then
-    printf '%s\n' "wipe" > "$STATE_FILE"
-    log "Armed wipe for UUID $UUID after removal of $DEVBASE"
-fi
-
-rm -f "$MAP_FILE"
 exit 0
 EOF
-
 chmod 0755 /usr/local/sbin/kiosk-remove-usb.sh
 
 cat > /usr/local/sbin/kiosk-recover-usb.sh <<'EOF'
@@ -298,7 +305,7 @@ STATE_DIR="/run/kiosk-usb-state"
 MAP_DIR="$STATE_DIR/by-devname"
 LOCKFILE="/run/kiosk-usb/import.lock"
 MOUNTROOT="/run/kiosk-usb"
-DESTROOT="/home/kiosk/usb-imports"
+DESTROOT="/home/kiosk"
 
 log() {
     logger -t kiosk-usb-recover "$*"
@@ -317,20 +324,12 @@ do_import() {
     local dev="$1"
     local uuid="$2"
     local mnt="$3"
-    local label dest safe_label stamp
+    local dest
 
-    label="$(blkid -o value -s LABEL "$dev" 2>/dev/null || true)"
-    safe_label="$(printf '%s' "${label:-usb}" | tr -cs 'A-Za-z0-9._-' '_')"
-    stamp="$(date +%Y%m%d-%H%M%S)"
-    dest="$DESTROOT/${stamp}_${safe_label}_${uuid}"
+    dest="$DESTROOT"
 
     mkdir -p "$mnt" || return 1
     mount -o ro,nosuid,nodev "$dev" "$mnt" || return 1
-    mkdir -p "$dest" || {
-        if mountpoint -q "$mnt"; then umount "$mnt" || true; fi
-        rmdir "$mnt" >/dev/null 2>&1 || true
-        return 1
-    }
 
     if rsync -a --protect-args "$mnt"/ "$dest"/; then
         chown -R kiosk:kiosk "$dest" || true
@@ -340,7 +339,6 @@ do_import() {
         sync
         return 0
     else
-        rm -rf "$dest" >/dev/null 2>&1 || true
         if mountpoint -q "$mnt"; then umount "$mnt" || true; fi
         rmdir "$mnt" >/dev/null 2>&1 || true
         return 1
@@ -375,10 +373,11 @@ done
 
 exit 0
 EOF
-
 chmod 0755 /usr/local/sbin/kiosk-recover-usb.sh
 
-echo "Creating systemd units..."
+# =========================
+# USB import systemd unit
+# =========================
 cat > /etc/systemd/system/kiosk-usb-import@.service <<'EOF'
 [Unit]
 Description=Import or wipe files from USB device /dev/%I
@@ -390,72 +389,62 @@ Type=oneshot
 ExecStart=/usr/local/sbin/kiosk-import-usb.sh /dev/%I
 EOF
 
-cat > /etc/systemd/system/kiosk-usb-remove@.service <<'EOF'
-[Unit]
-Description=Handle removal of USB device %I
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/kiosk-remove-usb.sh %I
-EOF
-
-echo "Creating udev rule..."
+# =========================
+# USB udev rules
+# =========================
 cat > /etc/udev/rules.d/99-kiosk-usb.rules <<'EOF'
-ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="kiosk-usb-import@%k.service"
-ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", TAG+="systemd", ENV{SYSTEMD_WANTS}+="kiosk-usb-remove@%k.service"
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", TAG+="systemd", ENV{SYSTEMD_WANTS}+="kiosk-usb-import@%k.service"
+ACTION=="remove", RUN+="/usr/local/sbin/kiosk-remove-usb.sh"
 EOF
 
-echo "Creating sudoers rule for kiosk recovery..."
-cat > /etc/sudoers.d/kiosk-usb <<'EOF'
+# =========================
+# Sudoers for recovery
+# =========================
+cat > /etc/sudoers.d/kiosk-usb-recover <<'EOF'
 kiosk ALL=(root) NOPASSWD: /usr/local/sbin/kiosk-recover-usb.sh
 EOF
-chmod 0440 /etc/sudoers.d/kiosk-usb
-visudo -cf /etc/sudoers.d/kiosk-usb
+chmod 0440 /etc/sudoers.d/kiosk-usb-recover
+visudo -cf /etc/sudoers.d/kiosk-usb-recover
 
-echo "Patching /etc/kiosk-skel/.bash_profile..."
-BASH_PROFILE="/etc/kiosk-skel/.bash_profile"
-RECOVER_LINE='        /usr/bin/sudo /usr/local/sbin/kiosk-recover-usb.sh'
-
-if [[ -f "$BASH_PROFILE" ]]; then
-  if ! grep -Fq '/usr/local/sbin/kiosk-recover-usb.sh' "$BASH_PROFILE"; then
-    python3 - "$BASH_PROFILE" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text()
-
-needle = "        startx"
-insert = "        /usr/bin/sudo /usr/local/sbin/kiosk-recover-usb.sh\n        startx"
-
-if needle in text and "/usr/local/sbin/kiosk-recover-usb.sh" not in text:
-    text = text.replace(needle, insert, 1)
-    path.write_text(text)
-else:
-    print("Could not patch .bash_profile automatically; please add manually before startx.", file=sys.stderr)
-PY
+# =========================
+# Add recovery hook to kiosk bash_profile
+# =========================
+if [ -f /etc/kiosk-skel/.bash_profile ]; then
+  if ! grep -q 'kiosk-recover-usb.sh' /etc/kiosk-skel/.bash_profile; then
+    awk '
+      /startx/ && !done {
+        print "        /usr/bin/sudo /usr/local/sbin/kiosk-recover-usb.sh"
+        done=1
+      }
+      { print }
+    ' /etc/kiosk-skel/.bash_profile > /etc/kiosk-skel/.bash_profile.new
+    mv /etc/kiosk-skel/.bash_profile.new /etc/kiosk-skel/.bash_profile
+    chown root:root /etc/kiosk-skel/.bash_profile
+    chmod 0644 /etc/kiosk-skel/.bash_profile
   fi
 else
-  echo "Warning: $BASH_PROFILE not found. Patch it manually to run:"
+  echo "Warning: /etc/kiosk-skel/.bash_profile not found. Add this line manually before startx:"
   echo "    /usr/bin/sudo /usr/local/sbin/kiosk-recover-usb.sh"
-  echo "before startx in the kiosk loop."
 fi
 
-echo "Reloading systemd / udev / tmpfiles..."
 systemctl daemon-reload
 udevadm control --reload
 systemd-tmpfiles --create /etc/tmpfiles.d/kiosk-usb.conf || true
 
 echo
-echo "Done."
+echo "USB handling installed."
 echo
-echo "Test with a disposable USB stick."
-echo "Expected workflow:"
-echo "  1. Fresh insert => import + happy beep"
-echo "  2. Remove stick => state armed for wipe"
-echo "  3. Reinsert same stick => whole USB disk wiped + FAT32 + wipe tune"
-echo "  4. Browser/session restart with stick still inserted => re-import + happy beep"
+echo "What was added:"
+echo " - /usr/local/sbin/kiosk-import-usb.sh"
+echo " - /usr/local/sbin/kiosk-remove-usb.sh"
+echo " - /usr/local/sbin/kiosk-recover-usb.sh"
+echo " - /etc/systemd/system/kiosk-usb-import@.service"
+echo " - /etc/udev/rules.d/99-kiosk-usb.rules"
+echo " - /etc/sudoers.d/kiosk-usb-recover"
 echo
-echo "Useful logs:"
-echo "  journalctl -f -t kiosk-usb"
-echo "  journalctl -f -t kiosk-usb-recover"
+echo "You should now:"
+echo "1. Reboot or restart the kiosk session"
+echo "2. Test fresh insert => import + happy beep"
+echo "3. Test browser close with stick inserted => re-import"
+echo "4. Test remove stick"
+echo "5. Test reinsert same stick => wipe + wipe tune"
