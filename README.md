@@ -317,3 +317,131 @@ Expected next steps:
    - browser close with stick still inserted → auto re-import  
    - remove stick  
    - reinsert same stick → wipe + wipe tune  
+---
+## Gotchas / Known Issues
+
+### Wi-Fi during install
+
+If Wi-Fi is configured during the Debian installer:
+
+- The connection may **appear configured but not usable** after first boot
+- NetworkManager may not pick it up properly
+
+**Recommendation:**
+
+- Prefer installing with **wired Ethernet**
+- Configure Wi-Fi **after installation**
+
+---
+
+### Configuring Wi-Fi
+
+Use:
+
+    sudo nmtui
+
+Why:
+
+- Network configuration is **system-level**
+- Running without `sudo` may:
+  - fail to save settings
+  - fail to activate connections
+  - appear to work, but not persist
+
+Notes:
+
+- `nmtui` is the preferred tool for initial setup
+- `nmcli` also works, but is less convenient
+- The kiosk user does **not** have access to network settings (by design)
+
+After configuration, verify:
+
+    nmcli device status
+
+You should see:
+
+    wlan0  wifi  connected
+
+---
+
+### Wrong disk selection
+
+During partitioning:
+
+- Make sure to select the **internal disk**
+- Do **not** select the USB installer
+
+If you get this wrong, the system may install to the USB stick and behave inconsistently.
+
+---
+
+### Desktop environment
+
+If you accidentally install a desktop environment:
+
+- It may interfere with:
+  - autologin
+  - `startx`
+  - Openbox session behavior
+
+**Fix:** reinstall cleanly without a desktop environment.
+
+---
+
+### Chromium not starting
+
+If the system boots but no browser appears:
+
+Check:
+
+- Did the install script complete without errors?
+- Does `startx` work manually?
+- Is `/home/kiosk` mounted as tmpfs?
+- Are permissions correct for the kiosk user?
+
+---
+
+### PC speaker (`beep`) not working
+
+- Some systems disable the PC speaker in firmware/BIOS
+- Some laptops do not have a functional PC speaker
+
+If `beep` does nothing:
+
+    lsmod | grep pcspkr
+
+If still silent, the hardware likely does not support it.
+
+---
+
+### USB stick behavior
+
+- The wipe operation reformats the **entire device**, not just a partition
+- Some sticks may change UUID after wipe (this is expected)
+- Very unusual or damaged sticks may fail import or wipe
+
+---
+
+### Timing expectations
+
+- USB import is event-driven (udev)
+- If nothing happens:
+  - wait a second or two
+  - then check logs:
+
+    journalctl -f -t kiosk-usb
+
+---
+
+### Debugging USB workflow
+
+Useful commands:
+
+    journalctl -f -t kiosk-usb
+    journalctl -f -t kiosk-usb-recover
+
+State files:
+
+    /run/kiosk-usb-state
+
+If behavior seems wrong, check the state files first.
