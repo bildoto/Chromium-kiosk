@@ -4,20 +4,104 @@ This script creates a browser kiosk on top of Debian Trixie.
 
 It uses a RAM-backed home directory for the kiosk user, resets the kiosk session whenever the browser is closed, powers off the machine when the lid is closed on a laptop, and includes automated USB import / wipe handling for scan sticks.
 
-It assumes Debian 13 (Trixie), where the packages used are available under the expected names, including:
+---
 
-- chromium
-- openbox
-- xorg
-- xinit
-- network-manager
-- cups
-- wmctrl
-- rsync
-- beep
-- dosfstools
-- python3
-- parted
+## Debian Installation (Trixie)
+
+This setup assumes a **minimal Debian 13 (Trixie) installation**.
+
+Follow these steps in the Debian installer:
+
+### Installer steps
+
+- Choose **Install**
+- Language: **English**
+- Location:
+  - Select **Other**
+  - Select **Europe**
+  - Select **Finland**
+- Locale: **United States (US)**
+- Keyboard: **Finnish**
+
+### System identity
+
+- Hostname: `asiakas1`
+- Domain: leave empty
+
+### Users and passwords
+
+- Root password:
+  - Press **Enter** to leave it empty
+  - Press **Enter** again to confirm  
+  → This disables the root account
+
+- Create user:
+  - Username: `sysop`
+  - Full name: press **Enter**
+  - Set a strong password
+  - Record it somewhere safe
+  - Repeat the password
+
+### Disk setup
+
+- Select **Guided - use entire disk**
+- Select the **internal hard drive**, not the USB installer
+- Select **All files in one partition**
+- Select **Finish partitioning and write changes to disk**
+- Confirm with **Yes**
+
+### Package manager and mirror
+
+- Scan extra installation media: **No**
+- Mirror country: **Finland**
+- Mirror: `www.nic.funet.fi`
+- HTTP proxy: leave empty
+- Participate in package survey: **No**
+
+### Software selection
+
+- **Deselect**:
+  - Debian desktop environment
+  - GNOME
+
+- **Select only**:
+  - SSH server
+  - Standard system utilities
+
+Use **spacebar** to toggle selections.
+
+### Bootloader
+
+- Install GRUB to the primary drive: **Yes**
+- Select the hard drive
+
+### Finish installation
+
+- Reboot when prompted
+
+After reboot, the system should boot into a **CLI login prompt**.
+
+---
+
+## Post-install setup
+
+Log in as:
+
+    sysop
+
+Run:
+
+    wget https://raw.githubusercontent.com/bildoto/Chromium-kiosk/refs/heads/main/install-kiosk.sh
+    chmod +x install-kiosk.sh
+    sudo ./install-kiosk.sh
+
+Then reboot:
+
+    sudo reboot
+
+After reboot, Chromium should start automatically.
+
+---
 
 ## Important Notes
 
@@ -49,6 +133,8 @@ It also installs a **USB workflow** with these behaviours:
 - browser/session restart with stick still inserted: re-import files
 - remove the stick: arm it for wipe
 - next insert of the same stick: wipe and reformat it
+
+---
 
 ## Final System Behavior
 
@@ -99,6 +185,8 @@ It also installs a **USB workflow** with these behaviours:
     lid closes
      ↓
     system powers off
+
+---
 
 ## USB Workflow
 
@@ -154,6 +242,8 @@ USB state is tracked in:
      ↓
     play happy beep
 
+---
+
 ## Kiosk Home Behavior
 
 The kiosk home directory is mounted as **tmpfs**, so it lives in RAM:
@@ -166,12 +256,14 @@ Default content is stored persistently in:
 
 Before each kiosk session, the script:
 
-1. wipes the current RAM home contents
-2. copies in the persistent skeleton
-3. restores USB imports if applicable
-4. starts X and Chromium
+1. wipes the current RAM home contents  
+2. copies in the persistent skeleton  
+3. restores USB imports if applicable  
+4. starts X and Chromium  
 
 This means browser-side state inside the kiosk home does not persist between sessions unless you deliberately add it to the skeleton.
+
+---
 
 ## What the script sets up
 
@@ -195,6 +287,8 @@ The script creates or configures:
 - lid-close poweroff behaviour
 - sysop notes file
 
+---
+
 ## What it does not do
 
 The script does not:
@@ -205,19 +299,21 @@ The script does not:
 - securely erase all storage on shutdown
 - preserve normal kiosk user data between sessions
 
+---
+
 ## After running the script
 
 Expected next steps:
 
-1. Reboot the machine
-2. Verify tty1 autologins as kiosk
-3. Verify Chromium opens maximized
-4. Verify closing Chromium resets the session
-5. Configure Wi-Fi with `nmtui` or `nmcli`
-6. Configure USB printer in CUPS at `http://localhost:631` if needed
-7. Test PC speaker with `beep`
+1. Reboot the machine  
+2. Verify tty1 autologins as kiosk  
+3. Verify Chromium opens maximized  
+4. Verify closing Chromium resets the session  
+5. Configure Wi-Fi with `nmtui` or `nmcli`  
+6. Configure USB printer in CUPS at `http://localhost:631` if needed  
+7. Test PC speaker with `beep`  
 8. Test USB workflow:
-   - fresh insert → import + happy beep
-   - browser close with stick still inserted → auto re-import
-   - remove stick
-   - reinsert same stick → wipe + wipe tune
+   - fresh insert → import + happy beep  
+   - browser close with stick still inserted → auto re-import  
+   - remove stick  
+   - reinsert same stick → wipe + wipe tune  
