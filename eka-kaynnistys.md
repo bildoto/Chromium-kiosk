@@ -1,49 +1,51 @@
-## Tietokoneen käyttöönotto (ensimmäinen kerta)
+## Wi-Fi-yhteyden käyttöönotto (ensimmäinen kerta)
 
-1. Tietokone toimii verkkokaapelilla tai Wi-Fi:llä.  
-   Mieti kumpi sopii paremmin teille.  
-   **Huom!** Jos käytät verkkokaapelia, kone on heti käyttövalmis.
+**Huom!** Näitä ohjeita tarvitaan vain, jos käytät Wi-Fi-yhteyttä.  
+Jos käytät verkkokaapelia, kone on heti käyttövalmis eikä näitä vaiheita tarvita.
 
-2. Kytke virtalähde tietokoneeseen ja käynnistä se.  
-   Jos käytät verkkokaapelia, liitä se samalla koneeseen.
+1. Käynnistä tietokone.
 
-3. Odota, että selain käynnistyy (yleensä alle minuutti).
+2. Odota, että selain käynnistyy (yleensä alle minuutti).
 
-4. Paina:
+3. Siirrytään asetustilaan. Paina:
 
        Ctrl + Alt + F2
+       (tai Fn + Ctrl + Alt + F2)
 
-5. Kirjaudu sisään:
+   Näet kirjautumisruudun (tekstipohjainen näkymä).
+
+4. Kirjaudu sisään:
    - käyttäjätunnus: `sysop`
    - salasana: *(valittu salasana)*
 
-6. Kirjoita:
+5. Kirjoita:
 
        sudo nmtui
 
    ja paina Enter.
 
-7. Siirry nuolinäppäimillä kohtaan **Activate a connection** ja paina Enter.
+6. Siirry nuolinäppäimillä kohtaan **Activate a connection** ja paina Enter.
 
-8. Valitse nuolinäppäimillä oikea verkko ja paina Enter.
+7. Valitse nuolinäppäimillä oikea verkko ja paina Enter.
 
-9. Kirjoita verkon salasana ja paina Enter.
+8. Kirjoita verkon salasana ja paina Enter.
 
-10. Jos yhteys onnistui, verkon eteen ilmestyy tähti.
+9. Jos yhteys onnistui, verkon eteen ilmestyy tähti.
 
-11. Paina ESC kaksi kertaa.
+10. Paina ESC kaksi kertaa palataksesi takaisin.
 
-12. Kirjoita:
+11. Kirjoita:
 
        exit
 
    ja paina Enter.
 
-13. Paina:
+12. Paina:
 
        Ctrl + Alt + F1
+       (tai Fn + Ctrl + Alt + F1)
 
-14. Kone on nyt käyttövalmis.  
-    Se yhdistää jatkossa automaattisesti verkkoon.  
+13. Selain näkyy taas ja kone on nyt käyttövalmis.  
+    Kone yhdistää jatkossa automaattisesti Wi-Fi-verkkoon.
 
     Jos haluat lisätä toisen langattoman verkon, voit tehdä sen samoilla ohjeilla.
