@@ -30,6 +30,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt update
 apt install -y \
   xorg \
+  xinit \
   openbox \
   chromium \
   network-manager \
@@ -42,7 +43,8 @@ apt install -y \
   beep \
   util-linux \
   dosfstools \
-  python3
+  python3 \
+  parted
 
 systemctl enable NetworkManager
 systemctl enable cups
@@ -54,11 +56,9 @@ if ! id "$KIOSK_USER" >/dev/null 2>&1; then
   adduser --disabled-password --gecos "Kiosk User" "$KIOSK_USER"
 fi
 
-# Disable password login for kiosk, but keep shell usable for autologin
 passwd -l "$KIOSK_USER" || true
 usermod -s /bin/bash "$KIOSK_USER"
 
-# Optional: sysop can manage printers
 if id "$SYSOP_USER" >/dev/null 2>&1; then
   usermod -aG lpadmin "$SYSOP_USER" || true
 fi
@@ -72,7 +72,6 @@ if ! grep -qE "^[^#].*\s/home/${KIOSK_USER}\s+tmpfs\s" /etc/fstab; then
   echo "tmpfs /home/${KIOSK_USER} tmpfs noatime,nodev,nosuid,size=${HOME_TMPFS_SIZE},uid=${KIOSK_USER},gid=${KIOSK_USER},mode=0700 0 0" >> /etc/fstab
 fi
 
-# Mount now if possible
 if ! mountpoint -q "/home/$KIOSK_USER"; then
   mount "/home/$KIOSK_USER" || true
 fi
@@ -84,7 +83,6 @@ chmod 0700 "/home/$KIOSK_USER"
 # Persistent skeleton
 # =========================
 mkdir -p /etc/kiosk-skel/.config/openbox
-mkdir -p /etc/kiosk-skel/usb-imports
 
 # =========================
 # Reset scripts
@@ -108,15 +106,32 @@ cat > /usr/local/sbin/kiosk-init-home.sh <<'EOF'
 set -e
 
 SRC="/etc/kiosk-skel/"
-DST="/home/kiosk/"
+DST="/home/kiosk"
 
 [ -d "$SRC" ] || exit 1
-[ -d "$DST" ] || exit 1
 
-/usr/bin/rsync -a --delete "$SRC" "$DST"
+mkdir -p "$DST"
+/usr/bin/rsync -a --delete "$SRC" "$DST"/
 chown -R kiosk:kiosk "$DST"
+chmod 0700 "$DST"
 EOF
 chmod 0755 /usr/local/sbin/kiosk-init-home.sh
+
+cat > /etc/systemd/system/kiosk-init-home.service <<'EOF'
+[Unit]
+Description=Initialize kiosk tmpfs home
+After=local-fs.target
+Before=getty@tty1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kiosk-init-home.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable kiosk-init-home.service
 
 # =========================
 # Chromium watchdog
@@ -142,7 +157,6 @@ chmod 0755 /usr/local/bin/kiosk-focus-chromium.sh
 mkdir -p /etc/modules-load.d
 echo pcspkr > /etc/modules-load.d/pcspkr.conf
 
-# Remove blacklist entries if present
 if grep -Rqs '^[[:space:]]*blacklist[[:space:]]\+pcspkr' /etc/modprobe.d 2>/dev/null; then
   grep -Rls '^[[:space:]]*blacklist[[:space:]]\+pcspkr' /etc/modprobe.d 2>/dev/null | while read -r f; do
     sed -i 's/^[[:space:]]*blacklist[[:space:]]\+pcspkr/# disabled by kiosk install: blacklist pcspkr/' "$f"
@@ -150,7 +164,17 @@ if grep -Rqs '^[[:space:]]*blacklist[[:space:]]\+pcspkr' /etc/modprobe.d 2>/dev/
 fi
 
 modprobe pcspkr || true
-chmod 4755 /usr/bin/beep || true
+
+cat > /etc/udev/rules.d/99-pcspkr.rules <<'EOF'
+SUBSYSTEM=="input", ATTRS{name}=="PC Speaker", GROUP="input", MODE="0660"
+EOF
+
+usermod -aG input "$KIOSK_USER" || true
+if id "$SYSOP_USER" >/dev/null 2>&1; then
+  usermod -aG input "$SYSOP_USER" || true
+fi
+
+chmod 0755 /usr/bin/beep || true
 
 # =========================
 # USB state runtime dirs
@@ -164,9 +188,6 @@ systemd-tmpfiles --create /etc/tmpfiles.d/kiosk-usb.conf || true
 
 mkdir -p /run/kiosk-usb
 mkdir -p /run/kiosk-usb-state/by-devname
-mkdir -p /home/kiosk/usb-imports
-chown kiosk:kiosk /home/kiosk/usb-imports || true
-chmod 700 /home/kiosk/usb-imports || true
 
 # =========================
 # USB import / wipe / recovery
@@ -180,7 +201,7 @@ STATE_DIR="/run/kiosk-usb-state"
 MAP_DIR="$STATE_DIR/by-devname"
 LOCKFILE="/run/kiosk-usb/import.lock"
 MOUNTROOT="/run/kiosk-usb"
-DESTROOT="/home/kiosk/usb-imports"
+DESTROOT="/home/kiosk"
 
 log() {
     logger -t kiosk-usb "$*"
@@ -280,19 +301,12 @@ do_import() {
     local dev="$1"
     local uuid="$2"
     local mnt="$3"
-    local label dest safe_label stamp
+    local dest
 
-    label="$(blkid -o value -s LABEL "$dev" 2>/dev/null || true)"
-    safe_label="$(printf '%s' "${label:-usb}" | tr -cs 'A-Za-z0-9._-' '_')"
-    stamp="$(date +%Y%m%d-%H%M%S)"
-    dest="$DESTROOT/${stamp}_${safe_label}_${uuid}"
+    dest="$DESTROOT"
 
     mkdir -p "$mnt" || return 1
     mount -o ro,nosuid,nodev "$dev" "$mnt" || return 1
-    mkdir -p "$dest" || {
-        cleanup_mount "$mnt"
-        return 1
-    }
 
     log "Importing from $dev to $dest"
 
@@ -303,7 +317,6 @@ do_import() {
         sync
         return 0
     else
-        rm -rf "$dest" >/dev/null 2>&1 || true
         cleanup_mount "$mnt"
         return 1
     fi
@@ -312,6 +325,7 @@ do_import() {
 do_wipe() {
     local dev="$1"
     local disk
+    local part
 
     disk="$(get_parent_disk "$dev")"
     [ -n "$disk" ] || return 1
@@ -320,7 +334,25 @@ do_wipe() {
     log "Wiping USB disk $disk for partition $dev"
 
     wipefs -a "$disk" >/dev/null 2>&1 || return 1
-    mkfs.vfat -F 32 -I "$disk" >/dev/null 2>&1 || return 1
+    parted -s "$disk" mklabel msdos >/dev/null 2>&1 || return 1
+    parted -s "$disk" mkpart primary fat32 1MiB 100% >/dev/null 2>&1 || return 1
+
+    partprobe "$disk" >/dev/null 2>&1 || true
+    udevadm settle >/dev/null 2>&1 || true
+    sleep 1
+
+    case "$disk" in
+      /dev/nvme*|/dev/mmcblk*)
+        part="${disk}p1"
+        ;;
+      *)
+        part="${disk}1"
+        ;;
+    esac
+
+    [ -b "$part" ] || return 1
+
+    mkfs.vfat -F 32 "$part" >/dev/null 2>&1 || return 1
     sync
     return 0
 }
@@ -341,14 +373,18 @@ fi
 mkdir -p "$STATE_DIR" "$MAP_DIR" "$MOUNTROOT" "$DESTROOT"
 
 UUID="$(get_uuid "$DEV")"
-[ -n "$UUID" ] || UUID="$(basename "$DEV")"
+if [ -z "$UUID" ]; then
+    log "No filesystem UUID found for $DEV, refusing to proceed"
+    sadmac_beep
+    exit 1
+fi
 
 STATE="$(read_state "$UUID")"
 DEVBASE="$(basename "$DEV")"
 MNT="$MOUNTROOT/$DEVBASE"
 
 exec 9>"$LOCKFILE"
-flock -n 9 || {
+flock -w 5 9 || {
     log "Another USB action is already running, refusing $DEV"
     sadmac_beep
     exit 1
@@ -393,34 +429,21 @@ cat > /usr/local/sbin/kiosk-remove-usb.sh <<'EOF'
 #!/bin/bash
 set -u
 
-DEVBASE="${1:-}"
 STATE_DIR="/run/kiosk-usb-state"
 MAP_DIR="$STATE_DIR/by-devname"
 
-log() {
-    logger -t kiosk-usb "$*"
-    echo "$*"
-}
+for map in "$MAP_DIR"/*; do
+    [ -f "$map" ] || continue
+    UUID="$(cat "$map" 2>/dev/null || true)"
+    [ -n "$UUID" ] || continue
+    STATE_FILE="$STATE_DIR/$UUID"
+    STATE="$(cat "$STATE_FILE" 2>/dev/null || true)"
+    if [ "$STATE" = "copied" ]; then
+        printf '%s\n' "wipe" > "$STATE_FILE"
+    fi
+    rm -f "$map"
+done
 
-if [ -z "$DEVBASE" ]; then
-    exit 0
-fi
-
-MAP_FILE="$MAP_DIR/$DEVBASE"
-[ -f "$MAP_FILE" ] || exit 0
-
-UUID="$(cat "$MAP_FILE" 2>/dev/null || true)"
-[ -n "$UUID" ] || exit 0
-
-STATE_FILE="$STATE_DIR/$UUID"
-STATE="$(cat "$STATE_FILE" 2>/dev/null || true)"
-
-if [ "$STATE" = "copied" ]; then
-    printf '%s\n' "wipe" > "$STATE_FILE"
-    log "Armed wipe for UUID $UUID after removal of $DEVBASE"
-fi
-
-rm -f "$MAP_FILE"
 exit 0
 EOF
 chmod 0755 /usr/local/sbin/kiosk-remove-usb.sh
@@ -433,7 +456,7 @@ STATE_DIR="/run/kiosk-usb-state"
 MAP_DIR="$STATE_DIR/by-devname"
 LOCKFILE="/run/kiosk-usb/import.lock"
 MOUNTROOT="/run/kiosk-usb"
-DESTROOT="/home/kiosk/usb-imports"
+DESTROOT="/home/kiosk"
 
 log() {
     logger -t kiosk-usb-recover "$*"
@@ -452,20 +475,12 @@ do_import() {
     local dev="$1"
     local uuid="$2"
     local mnt="$3"
-    local label dest safe_label stamp
+    local dest
 
-    label="$(blkid -o value -s LABEL "$dev" 2>/dev/null || true)"
-    safe_label="$(printf '%s' "${label:-usb}" | tr -cs 'A-Za-z0-9._-' '_')"
-    stamp="$(date +%Y%m%d-%H%M%S)"
-    dest="$DESTROOT/${stamp}_${safe_label}_${uuid}"
+    dest="$DESTROOT"
 
     mkdir -p "$mnt" || return 1
     mount -o ro,nosuid,nodev "$dev" "$mnt" || return 1
-    mkdir -p "$dest" || {
-        if mountpoint -q "$mnt"; then umount "$mnt" || true; fi
-        rmdir "$mnt" >/dev/null 2>&1 || true
-        return 1
-    }
 
     if rsync -a --protect-args "$mnt"/ "$dest"/; then
         chown -R kiosk:kiosk "$dest" || true
@@ -475,7 +490,6 @@ do_import() {
         sync
         return 0
     else
-        rm -rf "$dest" >/dev/null 2>&1 || true
         if mountpoint -q "$mnt"; then umount "$mnt" || true; fi
         rmdir "$mnt" >/dev/null 2>&1 || true
         return 1
@@ -523,18 +537,9 @@ Type=oneshot
 ExecStart=/usr/local/sbin/kiosk-import-usb.sh /dev/%I
 EOF
 
-cat > /etc/systemd/system/kiosk-usb-remove@.service <<'EOF'
-[Unit]
-Description=Handle removal of USB device %I
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/kiosk-remove-usb.sh %I
-EOF
-
 cat > /etc/udev/rules.d/99-kiosk-usb.rules <<'EOF'
-ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="kiosk-usb-import@%k.service"
-ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", TAG+="systemd", ENV{SYSTEMD_WANTS}+="kiosk-usb-remove@%k.service"
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", TAG+="systemd", ENV{SYSTEMD_WANTS}+="kiosk-usb-import@%k.service"
+ACTION=="remove", RUN+="/usr/local/sbin/kiosk-remove-usb.sh"
 EOF
 
 # =========================
@@ -606,7 +611,6 @@ chmod 0755 /etc/kiosk-skel/.xinitrc
 
 # =========================
 # Openbox config
-# Start from Debian default, then patch it
 # =========================
 cp /etc/xdg/openbox/rc.xml /etc/kiosk-skel/.config/openbox/rc.xml
 
@@ -621,16 +625,13 @@ ns_uri = "http://openbox.org/3.4/rc"
 ns = {"ob": ns_uri}
 ET.register_namespace("", ns_uri)
 
-# Set title layout to Name + Close
 for tl in root.findall(".//ob:theme/ob:titleLayout", ns):
     tl.text = "NC"
 
-# Empty keyboard bindings completely
 for kb in root.findall(".//ob:keyboard", ns):
     for child in list(kb):
         kb.remove(child)
 
-# Remove any mousebind that shows a menu
 for mouse in root.findall(".//ob:mouse", ns):
     for context in mouse.findall("ob:context", ns):
         for mb in list(context.findall("ob:mousebind", ns)):
@@ -685,9 +686,8 @@ USB add handler: /usr/local/sbin/kiosk-import-usb.sh
 USB remove handler: /usr/local/sbin/kiosk-remove-usb.sh
 USB recovery handler: /usr/local/sbin/kiosk-recover-usb.sh
 USB add service: /etc/systemd/system/kiosk-usb-import@.service
-USB remove service: /etc/systemd/system/kiosk-usb-remove@.service
 USB udev rules: /etc/udev/rules.d/99-kiosk-usb.rules
-USB import destination: /home/kiosk/usb-imports
+USB import destination: /home/kiosk
 USB state dir (RAM): /run/kiosk-usb-state
 USB workflow:
 - Insert fresh stick: import + happy beep
@@ -695,6 +695,7 @@ USB workflow:
 - Remove stick: arms wipe
 - Next insert of same stick: wipe + wipe tune
 PC speaker module: /etc/modules-load.d/pcspkr.conf
+PC speaker udev rule: /etc/udev/rules.d/99-pcspkr.rules
 Lid close poweroff: /etc/systemd/logind.conf
 Printing (CUPS): http://localhost:631
 Queue status: lpstat -t
